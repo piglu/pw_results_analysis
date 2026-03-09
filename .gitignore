@@ -1,0 +1,10 @@
+.env
+node_modules/
+.vscode/
+.idea/
+dist/
+build/
+*.log
+results_analysis_standalone_app.zip
+results.xml
+__pycache__/
