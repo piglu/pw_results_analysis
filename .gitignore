@@ -8,3 +8,4 @@ build/
 results_analysis_standalone_app.zip
 results.xml
 __pycache__/
+ai_config.json
