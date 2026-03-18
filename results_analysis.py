@@ -52,7 +52,6 @@ class AIWorker(QThread):
     def run(self):
         try:
             if self.provider == "OpenAI":
-
                 client = OpenAI(api_key=self.api_key)
 
                 response = client.chat.completions.create(
@@ -60,7 +59,21 @@ class AIWorker(QThread):
                     messages=[
                         {"role": "user", "content": self.prompt}
                     ],
-                    timeout=120
+                    timeout=300
+                )
+
+                text = response.choices[0].message.content
+
+            elif self.provider == "Deepseek":
+                client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+
+                response = client.chat.completions.create(
+                    model="deepseek-coder",
+                    max_tokens=4000,
+                    messages=[
+                        {"role": "user", "content": self.prompt}
+                    ],
+                    timeout=300
                 )
 
                 text = response.choices[0].message.content
@@ -73,7 +86,7 @@ class AIWorker(QThread):
                         "prompt": self.prompt,
                         "stream": False,
                         "options": {
-                            "num_predict": 800
+                            "num_predict": 600
                         }
                     },
                     timeout=300
@@ -97,7 +110,7 @@ class AIWorker(QThread):
 class AIAnalysisDialog(QDialog):
     AI_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "ai_config.json")
 
-    def __init__(self, failed_tests, parent=None):
+    def __init__(self, failed_tests, total_tests, parent=None):
         super().__init__(parent)
 
         self.ai_stage = "analysis"
@@ -110,6 +123,7 @@ class AIAnalysisDialog(QDialog):
         self.active_workers = []
         self.ai_results = []
         self.failed_tests = failed_tests
+        self.total_tests = total_tests
         self.api_key = None
 
         self.setWindowTitle("AI analiza testova")
@@ -121,10 +135,12 @@ class AIAnalysisDialog(QDialog):
 
         self.ai_combo = QComboBox()
         self.ai_combo.addItems([
+            "Deepseek",
             "OpenAI",
             "Ollama (local)"
         ])
         self.ai_combo.currentTextChanged.connect(self.update_ai_info)
+        self.ai_combo.currentTextChanged.connect(lambda: self.connect_button.setEnabled(True))
         layout.addWidget(provider_label)
         layout.addWidget(self.ai_combo)
 
@@ -145,15 +161,6 @@ class AIAnalysisDialog(QDialog):
         self.api_input = QLineEdit()
         self.api_input.setPlaceholderText("Upiši AI API ključ")
 
-        stored_key, stored_provider, stored_pw = self.load_ai_settings()
-        self.pw_version_input.setText(stored_pw)
-            
-        self.api_input.setText(stored_key)
-
-        index = self.ai_combo.findText(stored_provider)
-        if index >= 0:
-            self.ai_combo.setCurrentIndex(index)
-
         layout.addWidget(label)
         layout.addWidget(self.api_input)
 
@@ -162,8 +169,16 @@ class AIAnalysisDialog(QDialog):
         self.connect_button.clicked.connect(self.connect_with_ai)
         layout.addWidget(self.connect_button)
 
-        if stored_key:
-            self.connect_button.setEnabled(False)
+        stored_key, stored_provider, stored_pw = self.load_ai_settings()
+        self.pw_version_input.setText(stored_pw)
+            
+        self.api_input.setText(stored_key)
+        # if stored_key:
+        #     self.connect_button.setEnabled(False)
+
+        index = self.ai_combo.findText(stored_provider)
+        if index >= 0:
+            self.ai_combo.setCurrentIndex(index)
 
         # delimiter
         line = QFrame()
@@ -259,6 +274,14 @@ class AIAnalysisDialog(QDialog):
     def build_qa_prompt(self):
         stats = self.build_run_stats()
 
+        total_tests = self.total_tests
+        failed = len(self.failed_tests)
+        passed = total_tests - failed
+
+        failure_rate = 0
+        if total_tests > 0:
+            failure_rate = (failed / total_tests) * 100
+
         pw_version = self.pw_version_input.text().strip()
 
         if not pw_version:
@@ -281,6 +304,17 @@ class AIAnalysisDialog(QDialog):
     - CI stability recommendations
 
     Test run statistics:
+
+    Total tests: {total_tests}
+    Passed tests: {passed}
+    Failed tests: {failed}
+    Failure rate: {failure_rate:.2f}%
+
+    Interpretation rules:
+    - A failure rate below 1% usually indicates a stable test suite.
+    - Do NOT treat a very small number of failures as a major issue.
+    - Focus on practical triage recommendations.
+    - Provide realistic QA insights instead of dramatic conclusions.
 
     {stats}
     """
@@ -310,13 +344,21 @@ class AIAnalysisDialog(QDialog):
         if not pw_version:
             pw_version = "unknown"
 
+        context = self.load_error_context()
+
         for test in self.failed_tests:
+
+            code = self.get_test_code_snippet(test)
+
             failures += f"""
     Test name:
     {test.get("name", "")}
 
     Failure log:
     {test.get("failure_details", "")}
+
+    Test code snippet:
+    {code}
 
     """
 
@@ -326,6 +368,22 @@ class AIAnalysisDialog(QDialog):
     Playwright version used in the tests: {pw_version}
     Test framework: Playwright
     Language: JavaScript / TypeScript
+
+    Playwright error context:
+    {context}
+
+    Analysis rules:
+    - Do NOT suggest increasing timeouts as the primary solution.
+    - First identify the real root cause of the failure.
+    - Timeout increases should only be suggested if the failure is clearly caused by slow async loading.
+    - Prefer fixing locators, waits, or assertions instead of increasing timeouts.
+
+    Playwright locator best practices:
+    - Avoid locators that match multiple elements.
+    - Prefer stable locators such as data-testid or unique attributes.
+    - Avoid relying only on visible text when the UI is dynamic.
+    - If getByRole or getByText resolves multiple elements, suggest a more specific locator.
+    - Prefer deterministic selectors instead of generic ones.
 
     Below are failed automated tests.
 
@@ -349,7 +407,6 @@ class AIAnalysisDialog(QDialog):
     {failures}
     """
         return self.limit_prompt(prompt)
-        # return prompt
 
     def run_fix_suggestions(self):
         if self.ai_stage != "flaky":
@@ -366,7 +423,7 @@ class AIAnalysisDialog(QDialog):
 
         self.ai_stage = "done"
 
-        self.status_label.setText("AI analiza završena.")
+        # self.status_label.setText("AI analiza završena.")
 
         self.send_button.setEnabled(True)
 
@@ -409,7 +466,7 @@ class AIAnalysisDialog(QDialog):
             QMessageBox.warning(self, "Greška", "Upiši API ključ.")
             return
 
-        self.api_key = key
+        self.api_key = key if provider != "Ollama (local)" else None
 
         self.save_ai_settings(key, provider)
         QMessageBox.information(self, "AI", "Povezano i spremljeno.")
@@ -450,24 +507,37 @@ class AIAnalysisDialog(QDialog):
 
     def load_ai_settings(self):
         if not os.path.exists(self.AI_CONFIG_FILE):
-            return "", "OpenAI"
+            return "", "OpenAI", ""
 
         try:
             with open(self.AI_CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                return (data.get("api_key", ""), data.get("provider", "OpenAI"), data.get("pw_version", ""))
+
+            provider = data.get("provider", "OpenAI")
+            key = data.get(provider, "")
+            pw = data.get("playwright_version", "")
+
+            return key, provider, pw
+
         except:
-            return "", "OpenAI"
+            return "", "OpenAI", ""
 
     def save_ai_settings(self, key, provider):
-        data = {
-            "api_key": key,
-            "provider": provider,
-            "pw_version": self.pw_version_input.text().strip()
-        }
+        data = {}
+
+        if os.path.exists(self.AI_CONFIG_FILE):
+            with open(self.AI_CONFIG_FILE, "r") as f:
+                try:
+                    data = json.load(f)
+                except:
+                    data = {}
+
+        data[provider] = key or ""
+        data["provider"] = provider
+        data["playwright_version"] = self.pw_version_input.text().strip()
 
         with open(self.AI_CONFIG_FILE, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)
 
     def build_prompt(self, test):
         name = test.get("name", "")
@@ -520,28 +590,51 @@ class AIAnalysisDialog(QDialog):
 
     Below are AI analyses of failed automated tests.
 
-    Your task:
-    1. Identify the ROOT CAUSE of each failure.
-    2. Group failures that share the same root cause.
+    Your task is to GROUP failures by root cause.
 
-    IMPORTANT:
-    You MUST always output a section called:
+    IMPORTANT RULES:
+    - Do NOT write long explanations before the clusters.
+    - Start your response directly with the section:
 
     Failure clusters detected:
+
+    - You MUST always produce at least one cluster.
+    - If all failures share the same root cause, create a single cluster containing all tests.
+
+    Grouping rules:
+    - Failures with similar error messages belong to the same cluster.
+    - Locator errors should be grouped together.
+    - Timeout / visibility issues should be grouped together.
+    - Assertion mismatches should be grouped together.
+    - If two failures clearly share the same cause, place them in the same cluster.
+
+    Additionally classify each cluster as:
+    - Test issue
+    - Application bug
+    - Flaky test
+    - Environment issue
+
+    If the cluster is classified as "Application bug", also generate a short bug report title suitable for JIRA.
 
     Return the result strictly in this format:
 
     Failure clusters detected:
 
     Cluster 1
+    Type: (Test issue | Application bug | Flaky test | Environment issue)
+    Bug title: (only if Type = Application bug)
     Root cause:
     Description:
     Tests affected:
+    Confidence: (Low / Medium / High)
 
     Cluster 2
+    Type: (Test issue | Application bug | Flaky test | Environment issue)
+    Bug title: (only if Type = Application bug)
     Root cause:
     Description:
     Tests affected:
+    Confidence: (Low / Medium / High)
 
     Here are the analyses:
 
@@ -602,16 +695,43 @@ class AIAnalysisDialog(QDialog):
 
         if provider == "OpenAI":
             model = "gpt-4o-mini"
-
         elif provider == "Ollama (local)":
             model = "llama3"
-
+        elif provider == "Deepseek":
+            model = "deepseek-coder"
         else:
             model = "unknown"
 
         self.ai_info_label.setText(
             f"Provider: {provider} | Model: {model}"
         )
+
+        # učitaj config
+        data = {}
+        if os.path.exists(self.AI_CONFIG_FILE):
+            try:
+                with open(self.AI_CONFIG_FILE, "r") as f:
+                    data = json.load(f)
+            except:
+                data = {}
+
+        # Deepseek / OpenAI key (ako postoji)
+        key = data.get(provider, "")
+
+        # FIX: None -> ""
+        if not key:
+            key = ""
+
+        self.api_input.setText(key)
+
+        # enable/disable API input
+        if provider == "Ollama (local)":
+            self.api_input.setEnabled(False)
+        else:
+            self.api_input.setEnabled(True)
+
+        # connect button uvijek omogući kad promijeniš provider
+        self.connect_button.setEnabled(True)
 
     def build_summary_prompt(self):
         joined = "\n\n".join(self.ai_results[:10])
@@ -730,6 +850,8 @@ class AIAnalysisDialog(QDialog):
 
         if not pw_version:
             pw_version = "unknown"
+
+        context = self.load_error_context()
             
         for i, failure in enumerate(failures, start=1):
 
@@ -738,6 +860,8 @@ class AIAnalysisDialog(QDialog):
             test_names = ", ".join([t["name"] for t in tests])
 
             failure = failure[:800]
+
+            code = self.get_test_code_snippet(tests[0])
 
             combined += f"""
     Failure {i}
@@ -748,6 +872,9 @@ class AIAnalysisDialog(QDialog):
     Failure log:
     {failure}
 
+    Test code snippet:
+    {code}
+
     """
 
         prompt = f"""
@@ -757,6 +884,22 @@ class AIAnalysisDialog(QDialog):
     Test framework: Playwright
     Language: JavaScript / TypeScript
 
+    Playwright error context:
+    {context}
+
+    Analysis rules:
+    - Do NOT suggest increasing timeouts as the primary solution.
+    - First identify the real root cause of the failure.
+    - Timeout increases should only be suggested if the failure is clearly caused by slow async loading.
+    - Prefer fixing locators, waits, or assertions instead of increasing timeouts.
+
+    Playwright locator best practices:
+    - Avoid locators that match multiple elements.
+    - Prefer stable locators such as data-testid or unique attributes.
+    - Avoid relying only on visible text when the UI is dynamic.
+    - If getByRole or getByText resolves multiple elements, suggest a more specific locator.
+    - Prefer deterministic selectors instead of generic ones.
+
     Analyze the following unique test failures.
 
     Explain the root cause and possible fix.
@@ -764,7 +907,6 @@ class AIAnalysisDialog(QDialog):
     {combined}
     """
         return self.limit_prompt(prompt)
-        # return prompt
 
     def get_test_batches(self):
         batches = []
@@ -825,6 +967,19 @@ class AIAnalysisDialog(QDialog):
     Test framework: Playwright
     Language: JavaScript / TypeScript
 
+    Analysis rules:
+    - Do NOT suggest increasing timeouts as the primary solution.
+    - First identify the real root cause of the failure.
+    - Timeout increases should only be suggested if the failure is clearly caused by slow async loading.
+    - Prefer fixing locators, waits, or assertions instead of increasing timeouts.
+
+    Playwright locator best practices:
+    - Avoid locators that match multiple elements.
+    - Prefer stable locators such as data-testid or unique attributes.
+    - Avoid relying only on visible text when the UI is dynamic.
+    - If getByRole or getByText resolves multiple elements, suggest a more specific locator.
+    - Prefer deterministic selectors instead of generic ones.
+
     Detect if the following test failures could be FLAKY tests.
 
     Flaky tests usually fail due to:
@@ -869,7 +1024,7 @@ class AIAnalysisDialog(QDialog):
         self.ai_stage = "flaky"
         self.run_fix_suggestions()
 
-        self.status_label.setText("AI analiza završena.")
+        # self.status_label.setText("AI analiza završena.")
         # self.send_button.setEnabled(True)
 
     def start_ai_task(self, prompt, callback):
@@ -912,6 +1067,79 @@ class AIAnalysisDialog(QDialog):
 
         return text[:max_chars] + "\n\n[LOG TRUNCATED]"
 
+    def get_test_code_snippet(self, test):
+        raw_path = test.get("classname", "")
+        test_name = test.get("name", "")
+
+        if not raw_path:
+            return ""
+
+        raw_path = raw_path.replace("\\", os.sep).replace("/", os.sep)
+
+        file_path = None
+
+        for root, dirs, files in os.walk(os.getcwd()):
+            candidate = os.path.join(root, raw_path)
+            if os.path.exists(candidate):
+                file_path = candidate
+                break
+
+        if not file_path:
+            return ""
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            start_line = None
+
+            for i, line in enumerate(lines):
+                if test_name in line:
+                    start_line = i
+                    break
+
+            if start_line is None:
+                return "".join(lines[:60])
+
+            code_block = []
+            brace_count = 0
+            started = False
+
+            for line in lines[start_line:]:
+
+                if "{" in line:
+                    brace_count += line.count("{")
+                    started = True
+
+                if started:
+                    code_block.append(line)
+
+                if "}" in line:
+                    brace_count -= line.count("}")
+
+                if started and brace_count <= 0:
+                    break
+
+            return "".join(code_block[:120])
+
+        except Exception:
+            return ""
+
+    def load_error_context(self, max_chars=1500):
+        path = "error-context.md"
+
+        if not os.path.exists(path):
+            return ""
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            return content[:max_chars]
+
+        except Exception:
+            return ""
+
 
 class CustomToolbar(NavigationToolbar2QT):
     def __init__(self, canvas, parent):
@@ -931,6 +1159,7 @@ class ResultsAnalysisWindow(QDialog):
 
         current_os = platform.system()
 
+        self.total_tests = 0
         self.timeline_scroll_area = None
         self.timeline_index = None
         self.current_suite = None  # Tekući suite ili None ako nije izabran
@@ -1102,7 +1331,7 @@ class ResultsAnalysisWindow(QDialog):
         self.gantt_toolbar.setIconSize(QSize(24, 24))
 
         # Dodaj export akcije - samo na Linux-u
-        if current_os == "Linux":
+        if current_os in ["Linux", "Windows"]:
             png_action = QAction(QIcon("./res/png.png"), "Izvoz u PNG", self)
             png_action.triggered.connect(self.export_gantt_to_png_paginated)
             pdf_action = QAction(QIcon("./res/pdf.png"), "Izvoz u PDF", self)
@@ -1163,7 +1392,6 @@ class ResultsAnalysisWindow(QDialog):
         self.main_layout.addLayout(donji_blok_layout)
 
     def handle_send_to_ai(self):
-
         failed_tests = [
             tc for tc in self.testcase_rows
             if tc["status"] == "Failed"
@@ -1177,7 +1405,7 @@ class ResultsAnalysisWindow(QDialog):
             )
             return
 
-        dialog = AIAnalysisDialog(failed_tests, self)
+        dialog = AIAnalysisDialog(failed_tests, self.total_tests, self)
         dialog.exec()
 
     def load_results_file(self):
@@ -1211,9 +1439,11 @@ class ResultsAnalysisWindow(QDialog):
 
             if root.tag == "testsuite":
                 total_tests = int(root.attrib.get("tests", 0))
+                self.total_tests = total_tests
                 total_time = float(root.attrib.get("time", 0))
             else:
                 total_tests = int(root.attrib.get("tests", 0))
+                self.total_tests = total_tests
                 total_time = float(root.attrib.get("time", 0))
             
             self.total_execution_time = float(root.attrib.get("time", 0))
@@ -2151,7 +2381,6 @@ class ResultsAnalysisWindow(QDialog):
         return base
 
     def analyze_selected_test(self):
-
         row = self.testcase_table.currentRow()
 
         if row < 0:
@@ -2172,5 +2401,5 @@ class ResultsAnalysisWindow(QDialog):
         if not test:
             return
 
-        dialog = AIAnalysisDialog([test], self)
+        dialog = AIAnalysisDialog([test], self.total_tests, self)
         dialog.exec()

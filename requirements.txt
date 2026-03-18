@@ -7,3 +7,4 @@ PyPDF2
 psycopg2
 bcrypt
 openai
+requests
